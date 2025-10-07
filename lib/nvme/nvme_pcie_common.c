@@ -8,6 +8,7 @@
  * NVMe over PCIe common library
  */
 
+#include "spdk/log.h"
 #include "spdk/stdinc.h"
 #include "spdk/likely.h"
 #include "spdk/string.h"
@@ -24,15 +25,48 @@ static struct spdk_nvme_pcie_stat g_dummy_stat = {};
 static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
 		struct nvme_tracker *tr);
 
+
+
+//vanilla
+// static inline uint64_t
+// nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
+// {
+// 	if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
+// 		return spdk_vtophys(buf, size);
+// 	} else {
+// 		/* vfio-user address translation with IOVA=VA mode */
+// 		return (uint64_t)(uintptr_t)buf;
+// 	}
+// }
+
+#define VTIOCTL_GET_PHYS _IOR('p', 1, unsigned long)
+static uint64_t gesalous_vtophys(unsigned long vaddr)
+{
+	int fd = open("/dev/vtophys", O_RDONLY);
+	if (fd < 0) { perror("open"); return 1; }
+
+	unsigned long phys = (unsigned long)&vaddr;  /* any user VA */
+
+	if (ioctl(fd, VTIOCTL_GET_PHYS, &phys) == -1) { perror("ioctl"); return 1; }
+
+	SPDK_ERRLOG("Translation from module:--->VA 0x%lx -> PA 0x%lx\n", vaddr, phys);
+	close(fd);
+	return phys;
+}
 static inline uint64_t
 nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
 {
-	if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
-		return spdk_vtophys(buf, size);
-	} else {
-		/* vfio-user address translation with IOVA=VA mode */
-		return (uint64_t)(uintptr_t)buf;
-	}
+    if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
+        uint64_t pa = spdk_vtophys(buf, size);
+        if (pa == SPDK_VTOPHYS_ERROR) {
+            // Call your tiny module here
+            pa = gesalous_vtophys((unsigned long)buf);
+        }
+        return pa;
+    } else {
+        // vfio-user address translation with IOVA=VA mode
+        return (uint64_t)(uintptr_t)buf;
+    }
 }
 
 int
