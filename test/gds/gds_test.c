@@ -3,7 +3,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#define VTIOCTL_GET_PHYS _IOR('p', 1, unsigned long)
+
 
 
 #include <cuda.h>
@@ -21,7 +21,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/string.h"
 #include "spdk/vmd.h"
-#define CUDA_MEM_SIZE (2*1024*1024UL)
+#define CUDA_MEM_SIZE (4*1024UL)
 
 
 // static void vtophys(unsigned long vaddr)
@@ -146,8 +146,10 @@ int main(int argc, char **argv)
 	CUcontext context;
 
 	CUdeviceptr d_ptr;
+	CUdeviceptr d_ptr2;
 
 	void *bar_ptr = NULL;
+	void *bar_ptr2 = NULL;
 	gdr_t g = NULL;
 	gdr_mh_t mh;
 	int ret;
@@ -157,6 +159,7 @@ int main(int argc, char **argv)
 	cuCtxCreate(&context, 0, dev);
 
 	cuMemAlloc(&d_ptr, CUDA_MEM_SIZE);
+
 
 	g = gdr_open();
 	if (!g) {
@@ -177,7 +180,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	fprintf(stderr, "bar_ptr: %p \n", bar_ptr);
+	fprintf(stderr, "bar_ptr: %lu \n", bar_ptr);
+  /*<gesalous>*/
+	// cuMemAlloc(&d_ptr2, CUDA_MEM_SIZE);
+ //  	ret = gdr_pin_buffer(g, d_ptr2, CUDA_MEM_SIZE, 0, 0, &mh);
+	// if (ret) {
+	// 	fprintf(stderr, "gdr_pin_buffer for d_ptr2 failed\n");
+	// 	return 1;
+	// }
+
+	// ret = gdr_map(g, mh, &bar_ptr2, CUDA_MEM_SIZE);
+	// if (ret) {
+	// 	fprintf(stderr, "gdr_map (2) failed\n");
+	// 	return 1;
+	// }
+
+	// fprintf(stderr, "bar_ptr2: %lu \n", bar_ptr2);
+
+  /*</gesalous>*/
 
 	char *cpu_ptr = (char *)bar_ptr;
 
@@ -255,12 +275,13 @@ int main(int argc, char **argv)
 	// Allocate buffers (1 block size)
 	buffer_size = spdk_nvme_ns_get_sector_size(ctx.ns);
 	// read_buffer = spdk_zmalloc(buffer_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-  if (spdk_mem_register(bar_ptr, CUDA_MEM_SIZE) != 0) {
-    printf("Failed to register bar_ptr with SPDK\n");
-    spdk_env_fini();
-    return 1;
-  }
+  // if (spdk_mem_register(bar_ptr, CUDA_MEM_SIZE) != 0) {
+  //   printf("Failed to register bar_ptr with SPDK\n");
+  //   spdk_env_fini();
+  //   return 1;
+  // }
 	read_buffer = bar_ptr;
+  fprintf(stderr,"Set as destination buffer the GPU buffer (virtual address vtophys module will do the actual translation)\n");
 	write_buffer = spdk_zmalloc(buffer_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 
 	if (read_buffer == NULL || write_buffer == NULL) {

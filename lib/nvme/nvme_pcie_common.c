@@ -39,20 +39,62 @@ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
 // 	}
 // }
 
-#define VTIOCTL_GET_PHYS _IOR('p', 1, unsigned long)
-static uint64_t gesalous_vtophys(unsigned long vaddr)
+
+/*<gesalous>*/
+/* gesalous_vtophys.h
+ *
+ * uint64_t gesalous_vtophys(uint64_t vaddr);
+ *
+ *  – Looks up a GPU virtual address in /proc/driver/gdrdrv/gpumap
+ *  – Returns BAR-relative physical address on success
+ *  – Returns UINT64_MAX (all-ones) if the address is not found
+ *
+ *  Just add this file to your SPDK project and #include it
+ *  next to your other vtophys helpers.
+ */
+#include <stdint.h>
+
+#define GPUMAP_PATH "/proc/driver/gdrdrv/gpumap"
+#define VTOPHYS_ERR  UINT64_MAX              /* sentinel on failure */
+
+/* Public API */
+static uint64_t gesalous_vtophys(uint64_t vaddr)
 {
-	int fd = open("/dev/vtophys", O_RDONLY);
-	if (fd < 0) { perror("open"); return 1; }
-
-	unsigned long phys = (unsigned long)&vaddr;  /* any user VA */
-
-	if (ioctl(fd, VTIOCTL_GET_PHYS, &phys) == -1) { perror("ioctl"); return 1; }
-
-	SPDK_ERRLOG("Translation from module:--->VA 0x%lx -> PA 0x%lx\n", vaddr, phys);
-	close(fd);
-	return phys;
+    FILE *fp;
+    char line[256];
+    pid_t current_tgid = getpid();
+    
+    fp = fopen("/proc/driver/gdrdrv/gpumap", "r");
+    if (!fp) {
+        return 0;
+    }
+    
+    while (fgets(line, sizeof(line), fp)) {
+        int tgid;
+        uint64_t cpu_va, gpu_va, len;
+        
+        if (sscanf(line, "tgid=%d cpu_va=0x%lx gpu_va=0x%lx len=%lu",
+                   &tgid, &cpu_va, &gpu_va, &len) == 4) {
+            
+            // Check if TGID matches and vaddr is within the mapped range
+            if (tgid == current_tgid && 
+                vaddr >= cpu_va && 
+                vaddr < (cpu_va + len)) {
+                
+                fclose(fp);
+                // Return GPU VA with offset
+                fprintf(stderr,"GESALOUSTRA found a match cpu_addr: %lu gpu_bar: %lu\n",vaddr,gpu_va);
+                return gpu_va + (vaddr - cpu_va);
+            }
+        }
+    }
+    
+    fclose(fp);
+    return VTOPHYS_ERR; // No match found
 }
+
+/*</gesalous>*/
+
 static inline uint64_t
 nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
 {
