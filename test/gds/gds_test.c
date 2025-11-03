@@ -21,6 +21,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/string.h"
 #include "spdk/vmd.h"
+ 
 #define CUDA_MEM_SIZE (4*1024UL)
 
 
@@ -156,7 +157,7 @@ int main(int argc, char **argv)
 
 	cuInit(0);
 	cuDeviceGet(&dev, 0);
-	cuCtxCreate(&context, 0, dev);
+	cuCtxCreate(&context, NULL,0, dev);
 
 	cuMemAlloc(&d_ptr, CUDA_MEM_SIZE);
 
@@ -281,7 +282,7 @@ int main(int argc, char **argv)
   //   return 1;
   // }
 	read_buffer = bar_ptr;
-  fprintf(stderr,"Set as destination buffer the GPU buffer (virtual address vtophys module will do the actual translation)\n");
+	fprintf(stderr,"Set as destination buffer the GPU buffer (virtual address vtophys module will do the actual translation)\n");
 	write_buffer = spdk_zmalloc(buffer_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 
 	if (read_buffer == NULL || write_buffer == NULL) {
@@ -334,12 +335,71 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	/* <ballis> */
+
+	char *test_pattern = (char*) write_buffer;
+	for(size_t i = 0; i < buffer_size; ++i) test_pattern[i] = (char)(i % 256);
+	
+	printf("Writing to LBA 0 the test pattern.\n");
+	ctx.write_complete = false;
+	
+	rc = spdk_nvme_ns_cmd_write(ctx.ns, ctx.qpair, write_buffer, 0, 1, write_complete_cb, &ctx, 0);
+	if(rc != 0){
+		printf("Failed to submit write command\n");
+		goto cleanup;
+	}
+
+	while(!ctx.write_complete) spdk_nvme_qpair_process_completions(ctx.qpair, 0);
+
+	if(ctx.write_status != 0){
+		printf("Write operation failed\n");
+		goto cleanup;
+	}
+	printf("Write command completed successfully.\n");
+
+	printf("Issuing read command from LBA 0 to GPU buffer.\n");
+	// read_buffer is already pointing to bar_ptr
+	rc = spdk_nvme_ns_cmd_read(ctx.ns, ctx.qpair, read_buffer, 0, 1, read_complete_cb, &ctx, 0);
+	if (rc != 0) {
+		printf("Failed to submit read command\n");
+		goto cleanup;
+	}
+	while(!ctx.read_complete) spdk_nvme_qpair_process_completions(ctx.qpair, 0);
+
+	if(ctx.read_status != 0){
+		printf("Read operation failed\n");
+		goto cleanup;
+	}
+	printf("Read command completed successfully.\n");
+
+
+	printf("\n--- Starting Verification ---\n");
+	bool verification_passed = true;
+	char *gpu_result_ptr = (char *)bar_ptr; // Pointer to our data, now in GPU memory
+
+	for (size_t i = 0; i < buffer_size; ++i) {
+		if (gpu_result_ptr[i] != test_pattern[i]) {
+			printf("VERIFICATION FAILED at byte %zu!\n", i);
+			printf("Expected: 0x%02X,  Got: 0x%02X\n",
+				   (unsigned char)test_pattern[i], (unsigned char)gpu_result_ptr[i]);
+			verification_passed = false;
+			break;
+		}
+	}
+
+	if (verification_passed){
+		printf("SUCCESS: Data in GPU memory perfectly matches the original pattern.\n");
+		printf("The zero-copy NVMe -> GPU transfer was successful!\n");
+	} 
+	else{
+		printf("FAILURE: Data in GPU memory does not match the original pattern.\n");
+	}
+
+
+	/*</ballis>*/
 	printf("All operations completed successfully!\n");
 
 cleanup:
-	// if (read_buffer) {
-	// 	spdk_free(read_buffer);
-	// }
 	if (write_buffer) {
 		spdk_free(write_buffer);
 	}
@@ -350,7 +410,13 @@ cleanup:
 		spdk_nvme_detach(ctx.ctrlr);
 	}
 
+	gdr_unmap(g, mh, bar_ptr, CUDA_MEM_SIZE);
+	gdr_unpin_buffer(g, mh);
+	gdr_close(g);
+	cuMemFree(d_ptr);
+	cuCtxDestroy(context);
+
 	spdk_env_fini();
-	return (ctx.read_status == 0 && ctx.write_status == 0) ? 0 : 1;
+	return (ctx.read_status == 0 && ctx.write_status == 0 && verification_passed) ? 0 : 1;
 }
 
