@@ -57,6 +57,8 @@ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
 #define GPUMAP_PATH "/proc/driver/gdrdrv/gpumap"
 #define VTOPHYS_ERR  UINT64_MAX              /* sentinel on failure */
 
+
+
 /* Public API */
 static uint64_t gesalous_vtophys(uint64_t vaddr)
 {
@@ -95,15 +97,113 @@ static uint64_t gesalous_vtophys(uint64_t vaddr)
 
 /*</gesalous>*/
 
+
+/*<ballis>*/
+
+#define MAX_GDR_MAPPINGS 8
+
+//we will create a sort of "cache"
+typedef struct {
+    uint64_t cpu_va_start;
+    uint64_t gpu_va_start;
+    uint64_t mapping_len;
+} gdr_mapping_t;
+
+static gdr_mapping_t gdr_cache[MAX_GDR_MAPPINGS];
+static int num_mappings = 0;
+static bool cache_init = false;
+
+/**
+ * Parses /proc/driver/gdrdrv/gpumap to find and cache all memory mappings
+ * for the current process.
+ *
+ * one-time initialization function. It is called automatically on first failed vtophys lookup
+ */
+static void gdr_cache_populate(void){
+    FILE *fp;
+    char line[256];
+    pid_t current_pid = getpid();
+
+	if(cache_init){
+        // printf("--- SKIPPING populate, already initialized ---\n");
+        return;
+    }
+
+    fp = fopen("/proc/driver/gdrdrv/gpumap", "r");
+    if (!fp) {
+		//this can mean that maybe the user is not using GDRCopy, so we just set this as true so it doesnt run over and over again
+        cache_init = true;
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        int tgid;
+        uint64_t cpu_va, gpu_va, len;
+
+        if (num_mappings >= MAX_GDR_MAPPINGS) {
+            SPDK_ERRLOG("Exceeded max GDR mappings, some may be ignored.\n");
+            break;
+        }
+
+        if (sscanf(line, "tgid=%d cpu_va=0x%lx gpu_va=0x%lx len=%lu",
+                   &tgid, &cpu_va, &gpu_va, &len) == 4) {
+			if (tgid == current_pid) {
+				// printf("in gdr_cache_populate()\n");
+				//cache all mappings for our pid
+                gdr_cache[num_mappings].cpu_va_start = cpu_va;
+                gdr_cache[num_mappings].gpu_va_start = gpu_va;
+                gdr_cache[num_mappings].mapping_len = len;
+                num_mappings++;
+            }
+        }
+    }
+
+    fclose(fp);
+    
+    if (num_mappings > 0) {
+        SPDK_DEBUGLOG(nvme, "Successfully cached %d GDR mapping(s) for PID %d.\n", num_mappings, current_pid);
+    }
+    cache_init = true;
+}
+
+/**
+ * Translates a CPU virtual address to a GPU physical BAR address using
+ * the cached information
+ */
+static uint64_t
+gdr_cache_get_pa(uint64_t vaddr)
+{
+    for (int i = 0; i < num_mappings; ++i) {
+        if (vaddr >= gdr_cache[i].cpu_va_start &&
+            vaddr < (gdr_cache[i].cpu_va_start + gdr_cache[i].mapping_len)) {
+            // fprintf(stdout,"BALLIS found a match cpu_addr: %lu gpu_bar: %lu\n", gdr_cache[i].cpu_va_start, gdr_cache[i].gpu_va_start);
+            return gdr_cache[i].gpu_va_start + (vaddr - gdr_cache[i].cpu_va_start);
+        }
+    }
+    return SPDK_VTOPHYS_ERROR;
+}
+
+
+/*</ballis>*/
+
+
+
 static inline uint64_t
 nvme_pcie_vtophys(struct spdk_nvme_ctrlr *ctrlr, const void *buf, uint64_t *size)
 {
     if (spdk_likely(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE)) {
         uint64_t pa = spdk_vtophys(buf, size);
+		
         if (pa == SPDK_VTOPHYS_ERROR) {
-            // Call your tiny module here
-            pa = gesalous_vtophys((unsigned long)buf);
-        }
+            if(spdk_unlikely(!cache_init)){
+				gdr_cache_populate();
+			}
+            // pa = gesalous_vtophys((unsigned long)buf);
+			pa = gdr_cache_get_pa((uint64_t)buf);
+			if(pa == SPDK_VTOPHYS_ERROR){
+            	pa = gesalous_vtophys((unsigned long)buf);
+			}
+		}
         return pa;
     } else {
         // vfio-user address translation with IOVA=VA mode
