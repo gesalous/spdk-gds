@@ -2,12 +2,11 @@ APP ?=
 
 MAKEFILE_THIS := $(firstword $(MAKEFILE_LIST))
 
-APPS := nvme2gpu nvme2gpu_baseline nvme_gpu_verify path_bench
+APPS := nvme2gpu nvme2gpu_baseline 
 
 SPDK_APP_nvme2gpu_SRCS := benchmark.c gdr_gpumap_helper.c
 SPDK_APP_nvme2gpu_baseline_SRCS := baseline.c gdr_gpumap_helper.c
-SPDK_APP_nvme_gpu_verify_SRCS := nvme_gpu_verify.c gdr_gpumap_helper.c
-SPDK_APP_path_bench_SRCS := path_bench.c gdr_gpumap_helper.c
+
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
