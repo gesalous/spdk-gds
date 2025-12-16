@@ -3,11 +3,13 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <time.h>
 #include <pthread.h>
 #include <sched.h>
-
-
+#include <rte_vfio.h>
+#include <rte_config.h>
+#include "gdr_gpumap_helper.h"
 
 #include <cuda.h>
 #include <gdrapi.h>
@@ -26,10 +28,16 @@
 #include "spdk/vmd.h"
 #include "spdk/cpuset.h" 
 #include "spdk/util.h"
+#include "spdk/memory.h"  
+
 #include <cuda_runtime.h>
 // #include <stdatomic.h>
 
 // extern atomic_ullong g_vtophys_hook_successes;
+
+/* Provided by lib/env_dpdk (not exposed via public headers). */
+int vtophys_iommu_map_dma_bar(uint64_t vaddr, uint64_t iova, uint64_t size);
+int vtophys_iommu_unmap_dma_bar(uint64_t vaddr);
 
 
 
@@ -57,8 +65,15 @@ typedef struct {
 
     int num_threads;
     bool display_percentiles;
+    bool csv_output;
+    bool trim_before;
 
-} benchmark_opts_t;
+    /*hy647 project*/
+    char *traddr;  // IP Address
+    char *trsvcid; // Port
+    char *subnqn;  // NQN
+    bool is_rdma;
+}benchmark_opts_t;
 
 /**
  * @brief Holds resources that are initialized once and shared across all
@@ -80,6 +95,9 @@ typedef struct global_state {
     void*       bar_ptr;      // The single CPU-mapped pointer for the whole region
     size_t      mapped_size;  // Total size of the allocation
     bool        buf_pinned;
+    //used for mapping the gpu bar ptr to the iommu
+    bool        vfio_bar_mapped;
+    size_t      aligned_size;
 
     //A pointer to the command-line options for easy access
     benchmark_opts_t* opts;
@@ -171,6 +189,8 @@ static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion);
 static void global_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts);
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts);
 static inline uint64_t read_tsc(void);
+static void trim_completion_cb(void *arg, const struct spdk_nvme_cpl *completion);
+static int trim_namespace(global_state_t *state);
 /* =================================================================================================
  *                                              SPDK callbacks
  * ================================================================================================= */
@@ -178,6 +198,7 @@ static inline uint64_t read_tsc(void);
 
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts) {
     printf("Probing device at %s...\n", trid->traddr);
+    opts->keep_alive_timeout_ms = 0;
     return true;
 }
 
@@ -238,22 +259,32 @@ static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion) 
 int init_global_spdk(benchmark_opts_t *opts, global_state_t *state){
     struct spdk_env_opts spdk_opts;
     spdk_env_opts_init(&spdk_opts);
-    spdk_opts.core_mask = "0x1";
+    // spdk_opts.core_mask = "0x1";
     spdk_opts.name = "nvme2gpu-bench";
     
     if(spdk_env_init(&spdk_opts)<0){
         fprintf(stderr,"Failed to init SPDK\n");
         return -1;
     }
-
-    struct spdk_nvme_transport_id trid = {};
-    trid.trtype = SPDK_NVME_TRANSPORT_PCIE; //set the transport type
-
-    if (spdk_nvme_transport_id_parse_trtype(&trid, opts->pci_addr) != 0) {
-        fprintf(stderr, "Failed to parse PCIe address: %s\n", opts->pci_addr);
-        return -1;
+    struct spdk_nvme_transport_id trid = {};    
+    if(opts->is_rdma){
+        printf("Initializing NVMe-oF RDMA Transport...\n");
+        trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+        trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
+        snprintf(trid.traddr, sizeof(trid.traddr), "%s", opts->traddr);
+        snprintf(trid.trsvcid, sizeof(trid.trsvcid), "%s", opts->trsvcid);
+        snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", opts->subnqn);
     }
+    else{
+        
+        trid.trtype = SPDK_NVME_TRANSPORT_PCIE; //set the transport type
+        if (spdk_nvme_transport_id_parse_trtype(&trid, opts->pci_addr) != 0) {
+            fprintf(stderr, "Failed to parse PCIe address: %s\n", opts->pci_addr);
+            return -1;
+        }
 
+    }
+    
     //try to attach the drive
     if(spdk_nvme_probe(&trid, state, probe_cb, global_attach_cb, NULL) != 0){
         fprintf(stderr, "Failed to probe for NVMe devices\n");
@@ -283,39 +314,72 @@ int init_global_cuda_gdr(benchmark_opts_t *opts, global_state_t *state){
 
     //alloc enough memory for all in-flight operations PER thread
     state->mapped_size = (size_t)opts->num_threads * opts->queue_depth * opts->io_size;
-    if(cuMemAlloc(&state->d_ptr, state->mapped_size) != CUDA_SUCCESS) return -1; 
+    
+    // Align allocation to 2MB (hugepage size) for better IOMMU compatibility
+    state->aligned_size = (state->mapped_size + 0x1FFFFF) & ~0x1FFFFF; 
+    
+    if(cuMemAlloc(&state->d_ptr, state->aligned_size) != CUDA_SUCCESS) return -1; 
 
 
-    if(gdr_pin_buffer(state->gdr_handle, state->d_ptr, state->mapped_size, 0, 0, &state->gdr_mh) == 0)
+    if(gdr_pin_buffer(state->gdr_handle, state->d_ptr, state->aligned_size, 0, 0, &state->gdr_mh) == 0)
         state->buf_pinned = true;
     else
         return -1;
 
-    if(gdr_map(state->gdr_handle, state->gdr_mh, &state->bar_ptr, state->mapped_size) != 0)  return -1;
+    if(gdr_map(state->gdr_handle, state->gdr_mh, &state->bar_ptr, state->aligned_size) != 0)  return -1;
+    printf("aligned size: %lu \n",state->aligned_size);
     state->buf_pinned = true;
 
-    
-    //AB TEST
 
-    // state->mapped_size = (size_t)opts->num_threads * opts->queue_depth * opts->io_size;
-    // printf("Allocating %zu bytes of SPDK DMA memory...\n", state->mapped_size);
-    // state->bar_ptr = spdk_dma_malloc(state->mapped_size, 4096, NULL);
-    // if (state->bar_ptr == NULL) {
-    //     fprintf(stderr, "FATAL: Failed to allocate SPDK DMA memory.\n");
-    //     return -1;
-    // }
+    if(opts->is_rdma){
+        // ============================================================
+        // PATH A: NVMe-oF RDMA (GPUDirect RDMA)
+        // ============================================================
+        // For RDMA, we do NOT use VFIO. We use ibv_reg_mr (via SPDK).
+        // We must register the DEVICE POINTER (d_ptr), not the BAR pointer.
+        // nvidia-peermem handles the translation in the kernel.
+        
+        printf("Registering CUDA Device Pointer for RDMA (NVMe-oF)...\n");
+        
+        int rc = spdk_mem_register((void*)state->d_ptr, state->aligned_size);
+        if(rc != 0) {
+            fprintf(stderr, "FATAL: SPDK Mem Register failed. RC: %d, Errno: %d (%s)\n", 
+                    rc, errno, strerror(errno));
+            return -1;
+        }
+        printf("Successfully registered Device Pointer for RDMA.\n");
 
+    } else {
+        // ============================================================
+        // PATH B: Local PCIe P2P
+        // ============================================================
+        // For Local P2P, we use VFIO to tell the IOMMU that the NVMe drive
+        // is allowed to write to this GPU BAR address.
+        
+        uint64_t gpu_bar_pa = gdr_gpumap_translate_cpu_va((uint64_t)state->bar_ptr);
+        if (gpu_bar_pa == UINT64_MAX) {
+            fprintf(stderr, "Failed to translate GPU BAR via gpumap.\n");
+            return -1;
+        }
 
+        if(spdk_iommu_is_enabled()){
+            int vfio_rc = rte_vfio_container_dma_map(
+                RTE_VFIO_DEFAULT_CONTAINER_FD,
+                (uint64_t)state->bar_ptr,  // vaddr
+                gpu_bar_pa,                // iova
+                state->aligned_size
+            );
 
-    //off for NOW, on purpose
+            if (vfio_rc != 0) {
+                fprintf(stderr, "vfio map via SPDK helper failed: %d\n", vfio_rc);
+                return -1;
+            }
+            state->vfio_bar_mapped = true;
+            printf("Successfully mapped GPU memory to VFIO. Phys: 0x%lx\n", gpu_bar_pa);
+        }
+    }
 
-    // if(spdk_mem_register(state->bar_ptr, state->mapped_size) != 0) {
-    //     fprintf(stderr, "Failed to register GDR-mapped buffer with SPDK\n");
-    //     perror("REASON");
-    //     return -1;
-    // }
-
-    printf("Successfully initialized CUDA and mapped %zu bytes of GPU memory.\n", state->mapped_size);
+    printf("Successfully initialized CUDA/GDR.\n");
     return 0;
 }
 
@@ -442,13 +506,104 @@ int prepare_gpu_data(global_state_t* g_state) {
     return 0;
 }
 
+typedef struct {
+    bool completed;
+    int status;
+} trim_op_ctx_t;
+
+static void trim_completion_cb(void *arg, const struct spdk_nvme_cpl *completion) {
+    trim_op_ctx_t *ctx = (trim_op_ctx_t *)arg;
+    if (spdk_nvme_cpl_is_error(completion)) {
+        fprintf(stderr, "TRIM command failed: %s\n",
+                spdk_nvme_cpl_get_status_string(&completion->status));
+        ctx->status = -1;
+    } else {
+        ctx->status = 0;
+    }
+    ctx->completed = true;
+}
+
+static int trim_namespace(global_state_t *state) {
+    if (!state || !state->ns || !state->ctrlr) {
+        fprintf(stderr, "TRIM requested but controller or namespace is unavailable.\n");
+        return -1;
+    }
+
+    struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(state->ctrlr, NULL, 0);
+    if (!qpair) {
+        fprintf(stderr, "Failed to allocate qpair for TRIM operation.\n");
+        return -1;
+    }
+
+    const uint32_t sector_size = spdk_nvme_ns_get_sector_size(state->ns);
+    const uint64_t total_sectors = spdk_nvme_ns_get_num_sectors(state->ns);
+    if (sector_size == 0 || total_sectors == 0) {
+        fprintf(stderr, "Namespace reports invalid geometry; skipping TRIM.\n");
+        spdk_nvme_ctrlr_free_io_qpair(qpair);
+        return -1;
+    }
+
+    double total_gib = ((double)total_sectors * sector_size) / (1024.0 * 1024.0 * 1024.0);
+    printf("Issuing NVMe Dataset Management (TRIM) across %.2f GiB (%" PRIu64 " sectors).\n",
+           total_gib, total_sectors);
+
+    uint64_t trimmed = 0;
+    const uint64_t max_range = UINT32_MAX;
+
+    while (trimmed < total_sectors) {
+        uint64_t remaining = total_sectors - trimmed;
+        uint32_t this_len = (remaining > max_range) ? (uint32_t)max_range : (uint32_t)remaining;
+
+        struct spdk_nvme_dsm_range range = {
+            .starting_lba = trimmed,
+            .length = this_len,
+        };
+
+        trim_op_ctx_t cb_ctx = {.completed = false, .status = 0};
+        int rc = spdk_nvme_ns_cmd_dataset_management(
+            state->ns,
+            qpair,
+            SPDK_NVME_DSM_ATTR_DEALLOCATE,
+            &range,
+            1,
+            trim_completion_cb,
+            &cb_ctx);
+
+        if (rc != 0) {
+            fprintf(stderr, "Failed to submit TRIM command (rc=%d).\n", rc);
+            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            return -1;
+        }
+
+        while (!cb_ctx.completed) {
+            int poll_rc = spdk_nvme_qpair_process_completions(qpair, 0);
+            if (poll_rc < 0) {
+                fprintf(stderr, "Error while polling TRIM completion (rc=%d).\n", poll_rc);
+                spdk_nvme_ctrlr_free_io_qpair(qpair);
+                return -1;
+            }
+        }
+
+        if (cb_ctx.status != 0) {
+            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            return -1;
+        }
+
+        trimmed += this_len;
+    }
+
+    spdk_nvme_ctrlr_free_io_qpair(qpair);
+    printf("TRIM operation completed successfully.\n");
+    return 0;
+}
+
 
 /**
  * @brief The main function for each worker thread.
  *
  * This function is responsible for:
  * 1. Setting its CPU core affinity.
- * 2. Allocating its own SPDK queue pair and GPU buffer.
+ * 2. Allocating its own SPDK queue pair
  * 3. Running its portion of the benchmark I/O.
  * 4. Cleaning up its allocated resources.
  *
@@ -485,9 +640,14 @@ void *benchmark_thread_entry(void *arg) {
     size_t thread_buffer_size = (size_t)g_state->opts->queue_depth * g_state->opts->io_size;
     ctx->thread_bar_ptr       = (char*)g_state->bar_ptr + (ctx->t_id * thread_buffer_size);
     
+    // 2. GPU Device Pointer (Used for NVMe-oF Direct Path)
+    // We cast CUdeviceptr (which is usually uint64_t or void*) to char* to do byte math
     
-    void* end_addr = (char*)ctx->thread_bar_ptr + thread_buffer_size;
-    printf("Thread %d: Memory range [start: %p] to [end: %p] (Size: %zu bytes)\n", ctx->t_id, ctx->thread_bar_ptr, end_addr, thread_buffer_size);
+    void* thread_rdma_ptr = (void*)((char*)g_state->d_ptr + (ctx->t_id * thread_buffer_size));
+    
+    
+    // void* end_addr = (char*)ctx->thread_bar_ptr + thread_buffer_size;
+    // printf("Thread %d: Memory range [start: %p] to [end: %p] (Size: %zu bytes)\n", ctx->t_id, ctx->thread_bar_ptr, end_addr, thread_buffer_size);
 
     
     /**** general calculations used by everyone ****/
@@ -569,6 +729,9 @@ void *benchmark_thread_entry(void *arg) {
             }else    //"pseudo", imitating very fast ssd
                 lba = lba_start_for_this_thread;
 
+
+            
+
             int buffer_slot = submitted_ios % opts->queue_depth;
             void* buffer = (char*)ctx->thread_bar_ptr + (buffer_slot * opts->io_size);
 
@@ -576,15 +739,28 @@ void *benchmark_thread_entry(void *arg) {
             //get a pre-allocated io_ctx for this IO
             io_context_t* io_ctx = &ctx->io_contexts[buffer_slot];
 
+            void* io_target_buffer;
+            size_t io_offset = buffer_slot*opts->io_size;
+
+            if (g_state->opts->is_rdma) {
+                // NVMe-oF DIRECT PATH: 
+                // We use the GPU Device Address (thread_d_ptr) + offset
+                // nvidia-peermem handles the physical translation on the NIC side.
+                io_target_buffer = (void*)((char*)thread_rdma_ptr + io_offset);
+            } else {
+                // Local PCIe P2P: 
+                // We use the CPU Mapped Address (thread_bar_ptr) + offset
+                // IOMMU/VFIO handles the physical translation.
+                io_target_buffer = (void*)((char*)ctx->thread_bar_ptr + io_offset);
+            }
 
 
             int rc;
+            io_ctx->start_cycle = read_tsc();
             if(strcmp(opts->op, "read") == 0){
-                io_ctx->start_cycle = read_tsc();
-                rc = spdk_nvme_ns_cmd_read(g_state->ns, ctx->qpair, buffer, lba, n_sectors_per_io, read_complete_cb, io_ctx, 0);
+                rc = spdk_nvme_ns_cmd_read(g_state->ns, ctx->qpair, io_target_buffer, lba, n_sectors_per_io, read_complete_cb, io_ctx, 0);
             }else{
-                io_ctx->start_cycle = read_tsc();
-                rc = spdk_nvme_ns_cmd_write(g_state->ns, ctx->qpair, buffer, lba, n_sectors_per_io, write_complete_cb, io_ctx, 0);
+                rc = spdk_nvme_ns_cmd_write(g_state->ns, ctx->qpair, io_target_buffer, lba, n_sectors_per_io, write_complete_cb, io_ctx, 0);
             }
             if (rc != 0) {
                 if (rc == -ENOMEM) {
@@ -616,112 +792,6 @@ exit:
     return ret;
 }
 
-
-
-
-
-
-
-/*
-void run_gdr_benchmark(benchmark_opts_t *opts, app_state_t *state) {
-    printf("\n--- Running Benchmark [Method: gdr] ---\n");
-
-    printf("Operation type: %s | Pattern: %s | IO Size: %zu B | Queue Depth: %d | Total Size: %.2f GiB\n",
-           opts->op, opts->pattern, opts->io_size, opts->queue_depth, (double)opts->total_size / (1024*1024*1024));
-
-    uint64_t total_ios_to_submit = opts->total_size / opts->io_size;
-    uint64_t submitted_ios = 0;
-    state->completed_ios = 0;
-    state->test_active = true;
-
-
-    uint64_t ns_size_sectors = spdk_nvme_ns_get_num_sectors(state->ns);
-    uint32_t sector_size = spdk_nvme_ns_get_sector_size(state->ns);
-
-    if (opts->io_size % sector_size != 0) {
-        fprintf(stderr, "Error: IO size (%zu) must be a multiple of sector size (%u).\n", opts->io_size, sector_size);
-        return;
-    }
-    uint32_t n_sectors_per_io = opts->io_size / sector_size;
-
-    uint64_t max_lba = ns_size_sectors - n_sectors_per_io;
-    
-    srand(time(NULL));
-
-    if (strcmp(opts->op, "write") == 0) {
-        if (prepare_gpu_data(opts,state) != 0) {
-            fprintf(stderr, "Failed to prepare GPU data for writing.\n");
-            return;
-        }
-    }
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    while (state->test_active) {
-        //Submit new I/Os until the queue is full or we've submitted all work
-        
-        while ((submitted_ios < total_ios_to_submit) &&
-               (submitted_ios - state->completed_ios < (uint64_t)opts->queue_depth)) {
-            
-            uint64_t lba;
-
-            //check if pattern is random or sequential
-
-            if(strcmp(opts->pattern,"rand")==0)
-                lba = rand64() % (max_lba+1);
-            else if(strcmp(opts->pattern, "seq")==0)
-                lba = (submitted_ios * n_sectors_per_io) % ns_size_sectors;
-            else    
-                //pseudo, simulates very fast ssd
-                lba = 0;
-            
-            int buffer_slot = submitted_ios % opts->queue_depth;
-            
-            //destination buffer changes for every IO
-            void* buffer = (char*)state->bar_ptr + (buffer_slot * opts->io_size);
-            int rc = 0;
-            if(strcmp(opts->op,"read") == 0)
-                rc = spdk_nvme_ns_cmd_read(state->ns, state->qpair, buffer, lba, n_sectors_per_io, read_complete_cb, state, 0);
-            else
-                rc = spdk_nvme_ns_cmd_write(state->ns, state->qpair, buffer, lba, n_sectors_per_io, write_complete_cb, state, 0);
-            
-            if (rc != 0) {
-                fprintf(stderr, "Failed to submit read command (rc=%d). Aborting.\n", rc);
-                state->test_active = false;
-                break;
-            }
-            submitted_ios++;
-        }
-
-        //poll for completions
-        spdk_nvme_qpair_process_completions(state->qpair, 0);
-
-        //check if it is finished
-        if (state->completed_ios >= total_ios_to_submit) {
-            state->test_active = false;
-        }
-    }
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    //drain any remaining in-flight completions
-    while (state->completed_ios < submitted_ios)
-        spdk_nvme_qpair_process_completions(state->qpair, 0);
-    
-    // --- Calculate and print results ---
-    double elapsed_sec = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    double total_gb = (double)opts->total_size / (1024 * 1024 * 1024);
-    double throughput_mibps = ((double)opts->total_size / (1024 * 1024)) / elapsed_sec;
-    double iops = state->completed_ios / elapsed_sec;
-
-    printf("\n--- Results ---\n");
-    printf("Completed in: %.2f seconds.\n", elapsed_sec);
-    printf("Throughput:   %.2f MiB/s\n", throughput_mibps);
-    printf("IOPS:         %.0f ops/sec\n", iops);
-} 
-*/
-
 void print_usage(const char *prog_name) {
     printf("Usage: %s --pci <addr> [options]\n", prog_name);
     printf("\nRequired:\n");
@@ -734,6 +804,8 @@ void print_usage(const char *prog_name) {
     printf("  --total-size <bytes>   Total data to transfer (default: 10GiB).\n");
     printf("  --queue-depth <int>    Number of concurrent I/Os (default: 128).\n");
     printf("  --gpu-id <int>         GPU device ID to use (default: 0).\n");
+    printf("  --csv                  Print results as CSV (header + single data row).\n");
+    printf("  --trim-before          Issue NVMe Dataset Management (TRIM) before running writes.\n");
 }
 
 int compare_u64(const void *a, const void *b) {
@@ -755,7 +827,15 @@ int main(int argc, char **argv) {
         .op = "read",
         .pattern = "seq",
         .num_threads = 1,
-        .display_percentiles = false
+        .display_percentiles = false,
+        .csv_output = false,
+        .trim_before = false,
+        
+        /*hy647 project*/
+        .traddr = "127.0.0.1",
+        .trsvcid = "4420",
+        .subnqn = NULL,
+        .is_rdma = false
     };
 
     static struct option long_options[] = {
@@ -769,13 +849,19 @@ int main(int argc, char **argv) {
         {"pattern",     required_argument, 0, 'a'}, 
         {"num-threads", required_argument, 0, 'n'},
         {"percentiles", no_argument,       0, 'P'}, 
+        {"csv",         no_argument,       0, 'c'},
+        {"trim-before", no_argument,       0, 'T'},
+        {"ip",          required_argument, 0, 'I'},
+        {"port",        required_argument, 0, 'R'}, // 'P' is taken by percentiles
+        {"nqn",         required_argument, 0, 'N'},
         {"help",        no_argument,       0, 'h'},
+        
         {0, 0, 0, 0}
     };
 
     int opt;
     
-    while ((opt = getopt_long(argc, argv, "m:p:s:t:q:g:o:a:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:p:s:t:q:g:o:a:chT", long_options, NULL)) != -1) {
         switch (opt) {
             case 'm': opts.method = optarg; break;
             case 'p': opts.pci_addr = optarg; break;
@@ -787,13 +873,19 @@ int main(int argc, char **argv) {
             case 'a': opts.pattern = optarg; break;
             case 'n': opts.num_threads = atoi(optarg); break;
             case 'P': opts.display_percentiles = true; break; 
+            case 'c': opts.csv_output = true; break;
+            case 'T': opts.trim_before = true; break;
             case 'h': print_usage(argv[0]); return 0;
+            case 'I': opts.traddr = optarg; opts.is_rdma = true; break;
+            case 'R': opts.trsvcid = optarg; break;
+            case 'N': opts.subnqn = optarg; break;
             default: print_usage(argv[0]); return 1;
+
         }
     }
     
-    if(!opts.pci_addr){
-        fprintf(stderr, "Error: --pci <addr> is a required argument.\n");
+    if(!opts.pci_addr && !opts.is_rdma){
+        fprintf(stderr, "Error: --pci <addr> or --ip <addr> required.\n");
         print_usage(argv[0]);
         
         return 1;
@@ -825,6 +917,18 @@ int main(int argc, char **argv) {
         spdk_nvme_detach(g_state.ctrlr);
         spdk_env_fini();
         return 1;
+    }
+
+    if (opts.trim_before) {
+        if (strcmp(opts.op, "write") != 0) {
+            printf("--trim-before flag ignored for non-write workload.\n");
+        } else {
+            printf("\n--- Issuing TRIM before write workload ---\n");
+            if (trim_namespace(&g_state) != 0) {
+                fprintf(stderr, "FATAL: NVMe TRIM operation failed.\n");
+                goto cleanup;
+            }
+        }
     }
 
     //allocation and creation for threads
@@ -907,6 +1011,8 @@ int main(int argc, char **argv) {
     double total_iops = 0;
     double max_time_sec = 0;
     uint64_t total_completed_ios = 0;
+    double avg_latency_us = NAN;
+    bool latency_available = false;
 
     for (int i = 0; i < opts.num_threads; i++) {
         thread_ctx_t *ctx = &contexts[i];
@@ -997,6 +1103,9 @@ int main(int argc, char **argv) {
             printf("99.9th  : %10.2f\n", p999_us);
             printf("Max     : %10.2f\n", max_us);
 
+            avg_latency_us = avg_us;
+            latency_available = true;
+
             free(all_latencies);
         }
     } else {
@@ -1029,8 +1138,23 @@ int main(int argc, char **argv) {
             printf("------------------------\n");
             printf("Average : %10.2f\n", avg_us);
             printf("(Use --percentiles for detailed analysis)\n");
+
+            avg_latency_us = avg_us;
+            latency_available = true;
         } else {
             printf("\nNo successful I/Os were completed to calculate latency.\n");
+        }
+    }
+
+    if (opts.csv_output) {
+        const char *latency_str = latency_available ? "" : "N/A";
+        printf("\nmode,io_size,throughput_mibps,iops,latency_avg_us\n");
+        if (latency_available) {
+            printf("%s,%zu,%.2f,%.0f,%.2f\n", opts.pattern, opts.io_size,
+                   throughput_mibps, total_iops, avg_latency_us);
+        } else {
+            printf("%s,%zu,%.2f,%.0f,%s\n", opts.pattern, opts.io_size,
+                   throughput_mibps, total_iops, latency_str);
         }
     }
 
@@ -1039,6 +1163,11 @@ cleanup:
     // --- 6. Global Cleanup ---
     printf("\n--- Cleaning up global resources ---\n");
     spdk_nvme_detach(g_state.ctrlr);
+    if (g_state.vfio_bar_mapped && g_state.bar_ptr) {
+        spdk_mem_unregister(&g_state.bar_ptr,g_state.aligned_size);
+        vtophys_iommu_unmap_dma_bar((uint64_t)g_state.bar_ptr);
+        g_state.vfio_bar_mapped = false;
+    }
     if (g_state.bar_ptr) gdr_unmap(g_state.gdr_handle, g_state.gdr_mh, g_state.bar_ptr, g_state.mapped_size);
     if (g_state.buf_pinned) gdr_unpin_buffer(g_state.gdr_handle, g_state.gdr_mh);
     if (g_state.d_ptr) cuMemFree(g_state.d_ptr);

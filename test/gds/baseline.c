@@ -6,6 +6,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sched.h>
+#include <inttypes.h>
 
 
 
@@ -25,6 +26,7 @@
 #include "spdk/string.h"
 #include "spdk/vmd.h"
 #include "spdk/cpuset.h" 
+#include "spdk/nvmf_spec.h"
 #include <cuda_runtime.h>
 // #include <stdatomic.h>
 
@@ -56,6 +58,13 @@ typedef struct {
 
     int num_threads;
     bool display_percentiles;
+    bool csv_output;
+    bool trim_before;
+    /* NVMe-oF configuration */
+    char *traddr;   // IP address
+    char *trsvcid;  // Service ID / Port
+    char *subnqn;   // Subsystem NQN
+    bool is_rdma;
 } benchmark_opts_t;
 
 /**
@@ -85,6 +94,14 @@ typedef struct global_state {
 typedef struct io_context io_context_t;
 
 
+typedef struct {
+    uint64_t nvme_cycles;
+    uint64_t gpu_cycles;
+    uint64_t total_cycles;
+} latency_entry_t;
+
+
+
 /**
  * @brief Holds all resources and state for a single worker thread.
  * Each thread gets its own instance of this struct.
@@ -107,8 +124,8 @@ typedef struct{
 
     volatile int op_status; //0 = OK, -1 = error
 
-    uint64_t*   latencies;              // Array to store latency values in cycles
-    uint64_t    latencies_recorded;     // How many results we've stored
+    latency_entry_t*   latencies;              // Array to store latency values in cycles
+    uint64_t        latencies_recorded;     // How many results we've stored
     io_context_t*   io_contexts;        // A pre-allocated pool of contexts
     uint64_t        total_ios;          //total ios a thread will do
 
@@ -120,6 +137,7 @@ typedef struct{
 //a small helper struct to hold the start of each io
 struct io_context {
     uint64_t        start_cycle;
+    uint64_t        split_cycle;        //holds the middle timestamp
     thread_ctx_t*   thread_ctx; //pointer back to the parent thread
     void*           cpu_buffer_slot;
 };
@@ -163,6 +181,8 @@ static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion);
 static void global_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts);
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts);
 static inline uint64_t read_tsc(void);
+static void trim_completion_cb(void *arg, const struct spdk_nvme_cpl *completion);
+static int trim_namespace(global_state_t *state);
 /* =================================================================================================
  *                                              SPDK callbacks
  * ================================================================================================= */
@@ -170,6 +190,7 @@ static inline uint64_t read_tsc(void);
 
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts) {
     printf("Probing device at %s...\n", trid->traddr);
+    opts->keep_alive_timeout_ms = 0;
     return true;
 }
 
@@ -203,12 +224,20 @@ static void write_complete_cb(void *arg, const struct spdk_nvme_cpl *completion)
     // The operation was successful. Now, calculate and record the latency.
     uint64_t lat_cycles = end_cycle - ioctx->start_cycle;
     if(ctx->latencies_recorded < ctx->total_ios){
-        ctx->latencies[ctx->latencies_recorded++] = lat_cycles;
+        latency_entry_t *entry = &ctx->latencies[ctx->latencies_recorded++];
+
+        entry->gpu_cycles  = ioctx->split_cycle - ioctx->start_cycle;
+        entry->nvme_cycles = end_cycle - ioctx->split_cycle;
+        entry->total_cycles = end_cycle - ioctx->start_cycle;
     }
 }
 
 static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion) {
     
+    uint64_t nvme_end_cycle = read_tsc();
+
+
+
     io_context_t *ioctx = (io_context_t *)arg;
     thread_ctx_t *ctx = ioctx->thread_ctx;
     benchmark_opts_t *opts = ctx->gstate->opts;
@@ -228,7 +257,7 @@ static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion) 
     CUresult res = cuMemcpyHtoD(gpu_dest_slot, ioctx->cpu_buffer_slot, opts->io_size);
 
     // 3. Stop the timer *after* the GPU copy is complete. This is the true end-to-end time.
-    uint64_t end_cycle = read_tsc();
+    uint64_t gpu_end_cycle = read_tsc();
 
     // Now, handle the completion logic.
     ctx->completed_ios++;
@@ -239,9 +268,13 @@ static void read_complete_cb(void *arg, const struct spdk_nvme_cpl *completion) 
     } 
     else{
         // The full operation was successful. Record the latency.
-        uint64_t lat_cycles = end_cycle - ioctx->start_cycle;
         if(ctx->latencies_recorded < ctx->total_ios){
-            ctx->latencies[ctx->latencies_recorded++] = lat_cycles;
+            latency_entry_t *entry = &ctx->latencies[ctx->latencies_recorded++];
+            
+            // start_cycle = Time before SPDK submit
+            entry->nvme_cycles = nvme_end_cycle - ioctx->start_cycle;
+            entry->gpu_cycles  = gpu_end_cycle - nvme_end_cycle;
+            entry->total_cycles = gpu_end_cycle - ioctx->start_cycle;
         }
     }
 }
@@ -263,11 +296,24 @@ int init_global_spdk(benchmark_opts_t *opts, global_state_t *state){
     }
 
     struct spdk_nvme_transport_id trid = {};
-    trid.trtype = SPDK_NVME_TRANSPORT_PCIE; //set the transport type
 
-    if (spdk_nvme_transport_id_parse_trtype(&trid, opts->pci_addr) != 0) {
-        fprintf(stderr, "Failed to parse PCIe address: %s\n", opts->pci_addr);
-        return -1;
+    if (opts->is_rdma) {
+        printf("Initializing NVMe-oF RDMA transport to %s:%s (NQN %s) ...\n",
+               opts->traddr,
+               opts->trsvcid ? opts->trsvcid : "4420",
+               opts->subnqn ? opts->subnqn : "nqn.2016-06.io.spdk:cnode1");
+        trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+        trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
+        snprintf(trid.traddr, sizeof(trid.traddr), "%s", opts->traddr);
+        snprintf(trid.trsvcid, sizeof(trid.trsvcid), "%s", opts->trsvcid ? opts->trsvcid : "4420");
+        snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", opts->subnqn ? opts->subnqn : "nqn.2016-06.io.spdk:cnode1");
+    } else {
+        trid.trtype = SPDK_NVME_TRANSPORT_PCIE; //set the transport type
+
+        if (spdk_nvme_transport_id_parse_trtype(&trid, opts->pci_addr) != 0) {
+            fprintf(stderr, "Failed to parse PCIe address: %s\n", opts->pci_addr);
+            return -1;
+        }
     }
 
     //try to attach the drive
@@ -311,6 +357,97 @@ read_tsc(void)
 	uint32_t lo, hi;
 	__asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi) :: "rcx");
 	return ((uint64_t)hi << 32) | lo;
+}
+
+typedef struct {
+    bool completed;
+    int status;
+} trim_op_ctx_t;
+
+static void trim_completion_cb(void *arg, const struct spdk_nvme_cpl *completion) {
+    trim_op_ctx_t *ctx = (trim_op_ctx_t *)arg;
+    if (spdk_nvme_cpl_is_error(completion)) {
+        fprintf(stderr, "TRIM command failed: %s\n",
+                spdk_nvme_cpl_get_status_string(&completion->status));
+        ctx->status = -1;
+    } else {
+        ctx->status = 0;
+    }
+    ctx->completed = true;
+}
+
+static int trim_namespace(global_state_t *state) {
+    if (!state || !state->ns || !state->ctrlr) {
+        fprintf(stderr, "TRIM requested but controller or namespace is unavailable.\n");
+        return -1;
+    }
+
+    struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(state->ctrlr, NULL, 0);
+    if (!qpair) {
+        fprintf(stderr, "Failed to allocate qpair for TRIM operation.\n");
+        return -1;
+    }
+
+    const uint32_t sector_size = spdk_nvme_ns_get_sector_size(state->ns);
+    const uint64_t total_sectors = spdk_nvme_ns_get_num_sectors(state->ns);
+    if (sector_size == 0 || total_sectors == 0) {
+        fprintf(stderr, "Namespace reports invalid geometry; skipping TRIM.\n");
+        spdk_nvme_ctrlr_free_io_qpair(qpair);
+        return -1;
+    }
+
+    double total_gib = ((double)total_sectors * sector_size) / (1024.0 * 1024.0 * 1024.0);
+    printf("Issuing NVMe Dataset Management (TRIM) across %.2f GiB (%" PRIu64 " sectors).\n",
+           total_gib, total_sectors);
+
+    uint64_t trimmed = 0;
+    const uint64_t max_range = UINT32_MAX;
+
+    while (trimmed < total_sectors) {
+        uint64_t remaining = total_sectors - trimmed;
+        uint32_t this_len = (remaining > max_range) ? (uint32_t)max_range : (uint32_t)remaining;
+
+        struct spdk_nvme_dsm_range range = {
+            .starting_lba = trimmed,
+            .length = this_len,
+        };
+
+        trim_op_ctx_t cb_ctx = {.completed = false, .status = 0};
+        int rc = spdk_nvme_ns_cmd_dataset_management(
+            state->ns,
+            qpair,
+            SPDK_NVME_DSM_ATTR_DEALLOCATE,
+            &range,
+            1,
+            trim_completion_cb,
+            &cb_ctx);
+
+        if (rc != 0) {
+            fprintf(stderr, "Failed to submit TRIM command (rc=%d).\n", rc);
+            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            return -1;
+        }
+
+        while (!cb_ctx.completed) {
+            int poll_rc = spdk_nvme_qpair_process_completions(qpair, 0);
+            if (poll_rc < 0) {
+                fprintf(stderr, "Error while polling TRIM completion (rc=%d).\n", poll_rc);
+                spdk_nvme_ctrlr_free_io_qpair(qpair);
+                return -1;
+            }
+        }
+
+        if (cb_ctx.status != 0) {
+            spdk_nvme_ctrlr_free_io_qpair(qpair);
+            return -1;
+        }
+
+        trimmed += this_len;
+    }
+
+    spdk_nvme_ctrlr_free_io_qpair(qpair);
+    printf("TRIM operation completed successfully.\n");
+    return 0;
 }
 
 
@@ -482,7 +619,7 @@ void *benchmark_thread_entry(void *arg) {
     ctx->total_ios = total_ios_for_this_thread;
 
     // --- LATENCY SETUP ---
-    ctx->latencies = calloc(total_ios_for_this_thread, sizeof(uint64_t));
+    ctx->latencies = calloc(total_ios_for_this_thread, sizeof(latency_entry_t));
     ctx->latencies_recorded = 0;
     ctx->io_contexts = calloc(opts->queue_depth, sizeof(io_context_t));
     for (int i = 0; i < opts->queue_depth; i++) {
@@ -568,6 +705,9 @@ void *benchmark_thread_entry(void *arg) {
                     break; // Exit the submission loop
                 }
 
+                io_ctx->split_cycle = read_tsc(); // T1 (End of GPU, Start of NVMe)
+
+
                 // Step 2: CPU -> NVMe
                 rc = spdk_nvme_ns_cmd_write(g_state->ns, ctx->qpair, cpu_buffer, lba, n_sectors_per_io, write_complete_cb, io_ctx, 0);
             }
@@ -651,9 +791,13 @@ double calibrate_cpu_frequency(void) {
 
 
 void print_usage(const char *prog_name) {
-    printf("Usage: %s --pci <addr> [options]\n", prog_name);
+    printf("Usage: %s [--pci <addr> | --ip <addr> --nqn <nqn> [--port <svc>]] [options]\n", prog_name);
     printf("\nRequired:\n");
     printf("  --pci <addr>           PCIe address of the NVMe device (e.g., 0000:e3:00.0).\n");
+    printf("    OR\n");
+    printf("  --ip <addr>            NVMe-oF target IP (enables RDMA mode).\n");
+    printf("  --port <svc>           TCP/ROCE service ID / port (default: 4420).\n");
+    printf("  --nqn <string>         Subsystem NQN to connect to.\n");
     printf("\nOptions:\n");
     printf("  --operation <r|w>      I/O operation type: read or write (default: read).\n");
     printf("  --pattern <s|r|p>      Access pattern: seq, rand or pseudo(imitating very fast ssds) (default: seq).\n");
@@ -662,6 +806,8 @@ void print_usage(const char *prog_name) {
     printf("  --total-size <bytes>   Total data to transfer (default: 10GiB).\n");
     printf("  --queue-depth <int>    Number of concurrent I/Os (default: 128).\n");
     printf("  --gpu-id <int>         GPU device ID to use (default: 0).\n");
+    printf("  --csv                  Print summary in CSV form.\n");
+    printf("  --trim-before          Issue NVMe TRIM before write workloads.\n");
 }
 
 
@@ -671,6 +817,38 @@ int compare_u64(const void *a, const void *b) {
     if (val_a < val_b) return -1;
     if (val_a > val_b) return 1;
     return 0;
+}
+
+void print_percentile_stats(uint64_t *data, size_t count, double cycles_per_us, const char *label) {
+    qsort(data, count, sizeof(uint64_t), compare_u64);
+
+    // Calculate indices
+    uint64_t p50_i = (uint64_t)(0.50 * (count - 1));
+    uint64_t p90_i = (uint64_t)(0.90 * (count - 1));
+    uint64_t p99_i = (uint64_t)(0.99 * (count - 1));
+    uint64_t p999_i = (uint64_t)(0.999 * (count - 1));
+
+    // Convert to microseconds
+    double p50  = data[p50_i] / cycles_per_us;
+    double p90  = data[p90_i] / cycles_per_us;
+    double p99  = data[p99_i] / cycles_per_us;
+    double p999 = data[p999_i] / cycles_per_us;
+    double min  = data[0] / cycles_per_us;
+    double max  = data[count - 1] / cycles_per_us;
+
+    // Calculate Average
+    uint64_t sum = 0;
+    for(size_t i=0; i<count; i++) sum += data[i];
+    double avg = (sum / (double)count) / cycles_per_us;
+
+    printf("\n--- %s Statistics (us) ---\n", label);
+    printf("Average : %10.2f\n", avg);
+    printf("Min     : %10.2f\n", min);
+    printf("Median  : %10.2f\n", p50);
+    printf("90th    : %10.2f\n", p90);
+    printf("99th    : %10.2f\n", p99);
+    printf("99.9th  : %10.2f\n", p999);
+    printf("Max     : %10.2f\n", max);
 }
 
 int main(int argc, char **argv) {
@@ -684,7 +862,13 @@ int main(int argc, char **argv) {
         .op = "read",
         .pattern = "seq",
         .num_threads = 1,
-        .display_percentiles = false
+        .display_percentiles = false,
+        .csv_output = false,
+        .trim_before = false,
+        .traddr = NULL,
+        .trsvcid = "4420",
+        .subnqn = NULL,
+        .is_rdma = false
     };
 
     static struct option long_options[] = {
@@ -698,13 +882,18 @@ int main(int argc, char **argv) {
         {"pattern",     required_argument, 0, 'a'}, // 'a' for access pattern
         {"num-threads", required_argument, 0, 'n'},
         {"percentiles", no_argument,       0, 'P'},
+        {"csv",         no_argument,       0, 'c'},
+        {"trim-before", no_argument,       0, 'T'},
+        {"ip",          required_argument, 0, 'I'},
+        {"port",        required_argument, 0, 'R'},
+        {"nqn",         required_argument, 0, 'N'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    
-    while ((opt = getopt_long(argc, argv, "m:p:s:t:q:g:o:a:h", long_options, NULL)) != -1) {
+
+    while ((opt = getopt_long(argc, argv, "m:p:s:t:q:g:o:a:chTI:R:N:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'm': opts.method = optarg; break;
             case 'p': opts.pci_addr = optarg; break;
@@ -716,15 +905,31 @@ int main(int argc, char **argv) {
             case 'a': opts.pattern = optarg; break;
             case 'n': opts.num_threads = atoi(optarg); break;
             case 'P': opts.display_percentiles = true; break; // SET THE FLAG WHEN OPTION IS FOUND
+            case 'c': opts.csv_output = true; break;
+            case 'T': opts.trim_before = true; break;
+            case 'I':
+                opts.traddr = optarg;
+                opts.is_rdma = true;
+                break;
+            case 'R':
+                opts.trsvcid = optarg;
+                break;
+            case 'N':
+                opts.subnqn = optarg;
+                break;
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }
     
-    if(!opts.pci_addr){
-        fprintf(stderr, "Error: --pci <addr> is a required argument.\n");
+    if(!opts.pci_addr && !opts.is_rdma){
+        fprintf(stderr, "Error: specify --pci for local NVMe or --ip/--nqn for NVMe-oF.\n");
         print_usage(argv[0]);
-        
+        return 1;
+    }
+
+    if(opts.is_rdma && !opts.traddr){
+        fprintf(stderr, "Error: --ip is required when using NVMe-oF mode.\n");
         return 1;
     }
 
@@ -754,6 +959,18 @@ int main(int argc, char **argv) {
         spdk_nvme_detach(g_state.ctrlr);
         spdk_env_fini();
         return 1;
+    }
+
+    if (opts.trim_before) {
+        if (strcmp(opts.op, "write") != 0) {
+            printf("--trim-before flag ignored for non-write workload.\n");
+        } else {
+            printf("\n--- Issuing TRIM before write workload ---\n");
+            if (trim_namespace(&g_state) != 0) {
+                fprintf(stderr, "FATAL: NVMe TRIM operation failed.\n");
+                goto cleanup;
+            }
+        }
     }
 
 
@@ -827,6 +1044,8 @@ int main(int argc, char **argv) {
     double total_iops = 0;
     double max_time_sec = 0;
     uint64_t total_completed_ios = 0;
+    double avg_latency_us = NAN;
+    bool latency_available = false;
 
     for (int i = 0; i < opts.num_threads; i++) {
         thread_ctx_t *ctx = &contexts[i];
@@ -846,111 +1065,100 @@ int main(int argc, char **argv) {
     double total_bytes_transferred = (double)total_completed_ios * opts.io_size;
     double throughput_mibps = (total_bytes_transferred / (1024 * 1024)) / max_time_sec;
 
-    printf("\n--- Aggregated Results ---\n");
-    printf("Completed in:       %.2f seconds\n", max_time_sec);
+    uint64_t total_latencies_recorded = 0;
+    for (int i = 0; i < opts.num_threads; i++) {
+        total_latencies_recorded += contexts[i].latencies_recorded;
+    }
+    
+    // CPU Calibration
+    const double cpu_freq_ghz = calibrate_cpu_frequency();
+    if(cpu_freq_ghz == 0.0) { fprintf(stderr, "CPU Freq Fail\n"); goto cleanup; }
+    const double cycles_per_us = cpu_freq_ghz * 1000.0;
+
+    printf("\n======================================================\n");
+    printf("               BENCHMARK RESULTS                      \n");
+    printf("======================================================\n");
     printf("Total Throughput:   %.2f MiB/s\n", throughput_mibps);
     printf("Total IOPS:         %.0f ops/sec\n", total_iops);
-    // printf("Total successful vtophys hook translations: %llu\n", g_vtophys_hook_successes);
 
+    if (total_latencies_recorded == 0) {
+        printf("No successful I/Os recorded.\n");
+        goto cleanup;
+    }
 
     if (opts.display_percentiles) {
-        /****************************************************************
-         * DETAILED PERCENTILE ANALYSIS
-         ****************************************************************/
-        printf("\n--- Detailed Latency Analysis (Percentiles) ---\n");
+        // --- PERCENTILE MODE ---
+        
+        // Allocate a temporary buffer to sort one metric at a time
+        uint64_t *temp_buf = malloc(total_latencies_recorded * sizeof(uint64_t));
+        if (!temp_buf) { perror("malloc"); goto cleanup; }
 
-        uint64_t total_latencies_recorded = 0;
+        // 1. Extract and Analyze NVMe Leg
+        size_t k = 0;
         for (int i = 0; i < opts.num_threads; i++) {
-            total_latencies_recorded += contexts[i].latencies_recorded;
+            for (uint64_t j = 0; j < contexts[i].latencies_recorded; j++) {
+                temp_buf[k++] = contexts[i].latencies[j].nvme_cycles;
+            }
         }
+        print_percentile_stats(temp_buf, total_latencies_recorded, cycles_per_us, "NVMe Leg (Flash <-> CPU)");
 
-        if (total_latencies_recorded == 0) {
-            printf("No successful I/Os were recorded to calculate percentiles.\n");
-        } else {
-            uint64_t *all_latencies = malloc(total_latencies_recorded * sizeof(uint64_t));
-            if (all_latencies == NULL) {
-                fprintf(stderr, "FATAL: Failed to allocate memory for combined latency array.\n");
-                goto cleanup;
+        // 2. Extract and Analyze GPU Leg
+        k = 0;
+        for (int i = 0; i < opts.num_threads; i++) {
+            for (uint64_t j = 0; j < contexts[i].latencies_recorded; j++) {
+                temp_buf[k++] = contexts[i].latencies[j].gpu_cycles;
             }
-
-            uint64_t current_pos = 0;
-            for (int i = 0; i < opts.num_threads; i++) {
-                memcpy(all_latencies + current_pos, contexts[i].latencies, contexts[i].latencies_recorded * sizeof(uint64_t));
-                current_pos += contexts[i].latencies_recorded;
-            }
-
-            printf("Sorting %lu latency entries...\n", total_latencies_recorded);
-            qsort(all_latencies, total_latencies_recorded, sizeof(uint64_t), compare_u64);
-
-            const double cpu_freq_ghz = calibrate_cpu_frequency();
-            if (cpu_freq_ghz == 0.0) {
-                fprintf(stderr, "FATAL: Could not determine CPU frequency.\n");
-                free(all_latencies);
-                goto cleanup;
-            }
-            printf("Calibrated CPU frequency: %.2f GHz\n", cpu_freq_ghz);
-            const double cycles_per_microsecond = cpu_freq_ghz * 1000.0;
-            
-            uint64_t p50_index = (uint64_t)(0.50 * (total_latencies_recorded - 1));
-            uint64_t p90_index = (uint64_t)(0.90 * (total_latencies_recorded - 1));
-            uint64_t p99_index = (uint64_t)(0.99 * (total_latencies_recorded - 1));
-            uint64_t p999_index = (uint64_t)(0.999 * (total_latencies_recorded - 1));
-
-            double p50_us = all_latencies[p50_index] / cycles_per_microsecond;
-            double p90_us = all_latencies[p90_index] / cycles_per_microsecond;
-            double p99_us = all_latencies[p99_index] / cycles_per_microsecond;
-            double p999_us = all_latencies[p999_index] / cycles_per_microsecond;
-            double min_us = all_latencies[0] / cycles_per_microsecond;
-            double max_us = all_latencies[total_latencies_recorded - 1] / cycles_per_microsecond;
-            
-            uint64_t total_cycles = 0;
-            for(uint64_t i = 0; i < total_latencies_recorded; i++) total_cycles += all_latencies[i];
-            double avg_us = (total_cycles / (double)total_latencies_recorded) / cycles_per_microsecond;
-
-            printf("\nLatency Statistics (us):\n");
-            printf("------------------------\n");
-            printf("Average : %10.2f\n", avg_us);
-            printf("Min     : %10.2f\n", min_us);
-            printf("Median  : %10.2f (50th percentile)\n", p50_us);
-            printf("90th    : %10.2f\n", p90_us);
-            printf("99th    : %10.2f\n", p99_us);
-            printf("99.9th  : %10.2f\n", p999_us);
-            printf("Max     : %10.2f\n", max_us);
-
-            free(all_latencies);
         }
+        print_percentile_stats(temp_buf, total_latencies_recorded, cycles_per_us, "GPU Leg (CPU <-> GPU)");
+
+        // 3. Extract and Analyze Total End-to-End
+        k = 0;
+        for (int i = 0; i < opts.num_threads; i++) {
+            for (uint64_t j = 0; j < contexts[i].latencies_recorded; j++) {
+                temp_buf[k++] = contexts[i].latencies[j].total_cycles;
+            }
+        }
+        print_percentile_stats(temp_buf, total_latencies_recorded, cycles_per_us, "Total End-to-End");
+
+        free(temp_buf);
+
     } else {
-        /****************************************************************
-         * BASIC AVERAGE-ONLY ANALYSIS (DEFAULT)
-         ****************************************************************/
-        printf("\n--- Latency Analysis ---\n");
-
-        const double cpu_freq_ghz = calibrate_cpu_frequency();
-        if(cpu_freq_ghz == 0.0){
-            fprintf(stderr, "FATAL: Could not determine CPU frequency.\n");
-            goto cleanup;
-        }
-        printf("Calibrated CPU frequency: %.2f GHz\n", cpu_freq_ghz);
-        const double cycles_per_microsecond = cpu_freq_ghz * 1000.0;
-
-        uint64_t final_total_cycles = 0;
-        uint64_t final_io_count = 0;
-
-        for(int i = 0; i < opts.num_threads; i++) {
-            for(uint64_t j = 0; j < contexts[i].latencies_recorded; j++){
-                final_total_cycles += contexts[i].latencies[j];
+        // --- AVERAGE ONLY MODE ---
+        uint64_t sum_nvme = 0, sum_gpu = 0, sum_total = 0;
+        
+        for (int i = 0; i < opts.num_threads; i++) {
+            for (uint64_t j = 0; j < contexts[i].latencies_recorded; j++) {
+                sum_nvme  += contexts[i].latencies[j].nvme_cycles;
+                sum_gpu   += contexts[i].latencies[j].gpu_cycles;
+                sum_total += contexts[i].latencies[j].total_cycles;
             }
-            final_io_count += contexts[i].latencies_recorded;
         }
 
-        if (final_io_count > 0) {
-            double avg_us = (final_total_cycles / (double)final_io_count) / cycles_per_microsecond;
-            printf("\nLatency Statistics (us):\n");
-            printf("------------------------\n");
-            printf("Average : %10.2f\n", avg_us);
-            printf("(Use --percentiles for detailed analysis)\n");
+        double avg_nvme = (sum_nvme / (double)total_latencies_recorded) / cycles_per_us;
+        double avg_gpu  = (sum_gpu / (double)total_latencies_recorded) / cycles_per_us;
+        double avg_total = (sum_total / (double)total_latencies_recorded) / cycles_per_us;
+        
+        // Update the global var for CSV printing
+        avg_latency_us = avg_total; 
+        latency_available = true;
+
+        printf("\n--- Average Latencies (us) ---\n");
+        printf("NVMe Leg : %10.2f us\n", avg_nvme);
+        printf("GPU Leg  : %10.2f us\n", avg_gpu);
+        printf("Total    : %10.2f us\n", avg_total);
+        printf("(Run with --percentiles for p99/p99.9 breakdown)\n");
+    }
+
+
+    if (opts.csv_output) {
+        const char *lat_str = latency_available ? "" : "N/A";
+        printf("\nmode,io_size,throughput_mbs,IOPS,Latency_avg\n");
+        if (latency_available) {
+            printf("%s,%zu,%.2f,%.0f,%.2f\n", opts.pattern, opts.io_size,
+                   throughput_mibps, total_iops, avg_latency_us);
         } else {
-            printf("\nNo successful I/Os were completed to calculate latency.\n");
+            printf("%s,%zu,%.2f,%.0f,%s\n", opts.pattern, opts.io_size,
+                   throughput_mibps, total_iops, lat_str);
         }
     }
 
